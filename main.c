@@ -1,3 +1,7 @@
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <sys/ioctl.h>
 #include <errno.h>
@@ -6,12 +10,17 @@
 #include <termios.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/types.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define CHIP_VERSION "0.1"
+#define CHIP_TAB_SIZE 4
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define _TOUT STDOUT_FILENO
 #define _TIN STDIN_FILENO
+
 
 enum chip_key {
     ARROW_LEFT = 1000,
@@ -25,9 +34,23 @@ enum chip_key {
     PAGE_DOWN
 };
 
+typedef struct erow {
+    int size;
+    int rsize;
+    char *chars;
+    char *render;
+} erow;
+
 struct chip_config {
-    int cx, cy;
+    int cx, cy, rx;
+    int rowoff;
+    int coloff;
     int n_rows, n_cols;
+    int numrows;
+    erow *row;
+    char *filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
     struct termios start_termios;
 };
 
@@ -48,6 +71,10 @@ void enable_raw_mode();
 int get_window_size(int *rows, int *cols);
 int get_cursor_position(int *rows, int *cols);
 
+/* Message Bar */
+void chip_set_status_message(const char *fmt, ...);
+void chip_draw_message_bar(struct abuf *ab);
+
 /* Input Handling */
 int chip_read_key();
 void chip_process_key();
@@ -60,9 +87,22 @@ void chip_draw_rows(struct abuf *ab);
 /* Error Handling */
 void die(const char *s);
 
-int main() {
+/* File I/O */
+void chip_open(const char* filename);
+
+/* Row Operations */
+void chip_append_row(char *s, size_t len);
+void chip_update_row(erow *row);
+int chip_row_cx_to_rx(erow *row, int cx);
+void chip_scroll();
+void chip_draw_status_bar(struct abuf *ab);
+
+int main(int argc, char* argv[]) {
     enable_raw_mode();
     init_chip();
+    if (argc >= 2) chip_open(argv[1]);
+
+    chip_set_status_message("HELP: Ctrl-Q = quit");
 
     while (1) {
         chip_refresh_screen();
@@ -73,10 +113,18 @@ int main() {
 }
 
 void init_chip() {
-    config.cx = 0; config.cy = 0;
+    config.cx = 0; config.cy = 0; config.rx = 0;
+    config.rowoff = 0; config.coloff = 0;
+    config.numrows = 0;
+    config.row = NULL;
+    config.filename = NULL;
+    config.statusmsg[0] = '\0';
+    config.statusmsg_time = 0;
 
     if (get_window_size(&config.n_rows, &config.n_cols) == -1)
         die("Get Window Size");
+    
+    config.n_rows -= 2;
 }
 
 int chip_read_key() {
@@ -133,15 +181,26 @@ void chip_process_key() {
 
     switch (c) {
         case CTRL_KEY('q'):
-            write(_TOUT, "\x1b[2J", 4);
-            write(_TOUT, "\x1b[H", 3);
+            if (write(_TOUT, "\x1b[2J\x1b[H", 7) == -1)
+                die("Failed to quit properly");
             exit(0);
             break;
         case HOME_KEY: config.cx = 0; break;
-        case END_KEY: config.cy = config.n_cols - 1; break;
+        case END_KEY: {
+            if (config.cy < config.numrows)
+                config.cx = config.row[config.cy].size; 
+            break;
+        }
         case PAGE_UP:
         case PAGE_DOWN:
             {
+                if (c == PAGE_UP) {
+                    config.cy = config.rowoff;
+                } else if (c == PAGE_DOWN) {
+                    config.cy = config.rowoff + config.n_rows - 1;
+                    if (config.cy > config.numrows) config.cy = config.numrows;
+                }
+
                 int times = config.n_rows;
                 while (times--) chip_move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
             }
@@ -156,48 +215,60 @@ void chip_process_key() {
 }
 
 void chip_refresh_screen() {
+    chip_scroll();
+    
     struct abuf ab = ABUF_INIT;
 
     abAppend(&ab, "\x1b[?25l", 6); /* Hide cursor */
     abAppend(&ab, "\x1b[H", 3);    /* Reset Cursor */
 
     chip_draw_rows(&ab);
-    
+    chip_draw_status_bar(&ab);
+    chip_draw_message_bar(&ab);
+
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", config.cy + 1, config.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (config.cy - config.rowoff) + 1, 
+                                              (config.rx - config.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
     abAppend(&ab, "\x1b[?25h", 6); /* Unhide cursor */
     
-    write(_TOUT, ab.b, ab.len);
-    abFree(&ab);
+    if (write(_TOUT, ab.b, ab.len) == -1)   die("Failed to refresh screen");
 }
 
 void chip_draw_rows(struct abuf *ab) {
     int y;
     for (y = 0; y < config.n_rows; ++y) {
-        if (y == config.n_rows / 3) {
-            char welcome[80];
-            int welcomelen = snprintf(welcome, sizeof(welcome),
-                    "Chip Editor -- version %s", CHIP_VERSION);
+        int filerow = y + config.rowoff;
+        if (filerow >= config.numrows) {
+            if (config.numrows == 0 && y == config.n_rows / 3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome, sizeof(welcome),
+                        "Chip Editor -- version %s", CHIP_VERSION);
 
-            if (welcomelen > config.n_cols) welcomelen = config.n_cols;
-            
-            int padding = (config.n_cols - welcomelen) / 2;
+                if (welcomelen > config.n_cols) welcomelen = config.n_cols;
+                
+                int padding = (config.n_cols - welcomelen) / 2;
 
-            if (padding) {
+                if (padding) {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--) abAppend(ab, " ", 1);
+
+                abAppend(ab, welcome, welcomelen);
+            } else {
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while (padding--) abAppend(ab, " ", 1);
-
-            abAppend(ab, welcome, welcomelen);
         } else {
-            abAppend(ab, "~", 1);
+            int len = config.row[filerow].rsize - config.coloff;
+            if (len < 0) len = 0;
+            if (len > config.n_cols) len = config.n_cols;
+            abAppend(ab, &config.row[filerow].render[config.coloff], len);
         }
 
         abAppend(ab, "\x1b[K",3);
-        if (y < config.n_rows - 1) abAppend(ab, "\r\n", 2);
+        abAppend(ab, "\r\n", 2);
     }
 }
 
@@ -234,10 +305,10 @@ int get_window_size(int *rows, int *cols) {
 }
 
 void die(const char *s) {
-    write(_TOUT, "\x1b[2J", 4);
-    write(_TOUT, "\x1b[H", 3);
-    perror(s);
-    exit(1);
+    if (write(_TOUT, "\x1b[2J\x1b[H", 7) == -1) {
+        perror(s);
+        exit(1);
+    }    
 }
 
 void enable_raw_mode() {
@@ -275,10 +346,157 @@ void abFree(struct abuf *ab) {
 }
 
 void chip_move_cursor(int key) {
+    erow *row = (config.cy >= config.n_rows) ? NULL : &config.row[config.cy];
     switch (key) {
-        case ARROW_UP:    if (config.cy != 0)               config.cy--; break;
-        case ARROW_LEFT:  if (config.cx != 0)               config.cx--; break;
-        case ARROW_DOWN:  if (config.cy != config.n_rows)   config.cx++; break;
-        case ARROW_RIGHT: if (config.cx != config.n_cols)   config.cy++; break;
+        case ARROW_UP: {
+            if (config.cy != 0) config.cy--; 
+            break;
+        }
+        case ARROW_LEFT:  {
+            if (config.cx != 0) config.cx--;
+            else if (config.cy > 0) {
+                config.cy--;
+                config.cx = config.row[config.cy].size;
+            }
+            break;
+        }
+        case ARROW_DOWN: {
+            if (config.cy < config.numrows) config.cy++; 
+            break;
+        }
+        case ARROW_RIGHT: {
+            if (row && config.cx < row->size) config.cx++; 
+            else if (row && config.cx == row->size) {
+                config.cy++;
+                config.cx = 0;
+            }
+            break;
+        }
     }
+
+    row = (config.cy >= config.numrows) ? NULL : &config.row[config.cy];
+    int rowlen = row ? row->size : 0;
+    if (config.cx > rowlen) config.cx = rowlen;
+}
+
+void chip_open(const char* filename) {
+    free(config.filename);
+    config.filename = strdup(filename);
+
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    while ((linelen = getline(&line, &linecap, fp)) != -1) {
+        while (linelen > 0 && (line[linelen - 1] == '\n' || line[linelen - 1] == '\r')) {
+            linelen--;
+        }
+        chip_append_row(line, linelen);
+    }
+
+    free(line);
+    fclose(fp);
+}
+
+void chip_append_row(char *s, size_t len) {
+    config.row = realloc(config.row, sizeof(erow) * (config.numrows + 1));
+
+    int at = config.numrows;
+    config.row[at].size = len;
+    config.row[at].chars = malloc(len + 1);
+    memcpy(config.row[at].chars, s, len);
+    config.row[at].chars[len] = '\0';
+
+    config.row[at].rsize = 0;
+    config.row[at].render = NULL;
+    chip_update_row(&config.row[at]);
+
+    config.numrows++;
+}
+
+void chip_scroll() {
+    config.rx = 0;
+    if (config.cy < config.numrows) 
+        config.rx = chip_row_cx_to_rx(&config.row[config.cy], config.cx);
+
+    if (config.cy < config.rowoff)  config.rowoff = config.cy;
+    if (config.rx < config.coloff) config.coloff = config.rx;
+
+    if (config.cy >= config.rowoff + config.n_rows) 
+        config.rowoff = config.cy - config.n_rows + 1;
+    if (config.rx >= config.coloff + config.n_cols) 
+        config.coloff = config.rx - config.n_cols + 1;
+}
+
+void chip_update_row(erow *row) {
+    int tabs = 0;
+    int j;
+    for (j = 0; j < row->size; j++) 
+        if (row->chars[j] == '\t') tabs++;
+
+    free(row->render);
+    row->render = malloc(row->size + (tabs * (CHIP_TAB_SIZE-1)) + 1);
+
+    int idx = 0;
+    for (j = 0; j < row->size; ++j) {
+        if (row->chars[j] == '\t') {
+            row->render[idx++] = ' ';
+            while (idx % CHIP_TAB_SIZE != 0) row->render[idx++] = ' ';
+        } else {
+            row->render[idx++] = row->chars[j];
+        }
+    }
+    row->render[idx] = '\0';
+    row->rsize = idx;
+}
+
+int chip_row_cx_to_rx(erow *row, int cx) {
+    int j, rx = 0;
+    for (j = 0; j < cx; ++j) {
+        if (row->chars[j] == '\t')
+            rx += (CHIP_TAB_SIZE - 1) - (rx % CHIP_TAB_SIZE);
+        rx++;
+    }
+    return rx;
+}
+
+void chip_draw_status_bar(struct abuf *ab) {
+    abAppend(ab, "\x1b[7m",4);
+    char status[80], rstatus[80];
+
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+        config.filename ? config.filename : "[NO FILE]", config.numrows);
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", config.cy + 1, 
+        config.numrows);
+
+    if (len > config.n_cols) len = config.n_cols;
+    abAppend(ab, status, len);
+    while (len < config.n_cols) {
+        if (config.n_cols - len == rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
+        }
+    }
+    abAppend(ab, "\x1b[m\r\n", 5);
+}
+
+void chip_set_status_message(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(config.statusmsg, sizeof(config.statusmsg), fmt, ap);
+    va_end(ap);
+    config.statusmsg_time = time(NULL);
+}
+
+void chip_draw_message_bar(struct abuf *ab) {
+    abAppend(ab, "\x1b[K", 3);
+    int msglen = strlen(config.statusmsg);
+    if (msglen > config.n_cols) msglen = config.n_cols;
+    if (msglen && time(NULL) - config.statusmsg_time < 5)
+        abAppend(ab, config.statusmsg, msglen);
 }
